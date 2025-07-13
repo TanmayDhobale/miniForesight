@@ -1,0 +1,39 @@
+{
+  "name": "prediction-market",
+  "version": "1.0.0",
+  "description": "Decentralized prediction market platform on Solana",
+  "main": "index.js",
+  "scripts": {
+    "test": "anchor test",
+    "build": "anchor build",
+    "deploy": "anchor deploy",
+    "lint": "eslint . --ext .ts",
+    "format": "prettier --write ."
+  },
+  "keywords": [
+    "solana",
+    "anchor",
+    "prediction-market",
+    "defi",
+    "blockchain"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.31.0",
+    "@solana/web3.js": "^1.95.0",
+    "@solana/spl-token": "^0.4.0"
+  },
+  "devDependencies": {
+    "@types/chai": "^4.3.0",
+    "@types/mocha": "^10.0.0",
+    "@typescript-eslint/eslint-plugin": "^5.0.0",
+    "@typescript-eslint/parser": "^5.0.0",
+    "chai": "^4.3.0",
+    "eslint": "^8.0.0",
+    "mocha": "^10.0.0",
+    "prettier": "^2.8.0",
+    "ts-mocha": "^10.0.0",
+    "typescript": "^4.9.0"
+  }
+} 

@@ -1,0 +1,25 @@
+[features]
+seeds = false
+skip-lint = false
+
+[programs.localnet]
+prediction_market = "11111111111111111111111111111112"
+
+[programs.devnet]
+prediction_market = "11111111111111111111111111111112"
+
+[programs.testnet]
+prediction_market = "11111111111111111111111111111112"
+
+[programs.mainnet]
+prediction_market = "11111111111111111111111111111112"
+
+[registry]
+url = "https://api.anchor.projectserum.com"
+
+[provider]
+cluster = "localnet"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts" 
