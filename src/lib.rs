@@ -1,51 +1,44 @@
 use anchor_lang::prelude::*;
-use anchor_spl::{
-    associated_token::AssociatedToken,
-    token::{self, Mint, Token, TokenAccount, Transfer},
-};
+use anchor_spl::token::{self, Token, TokenAccount, Transfer, Mint};
 
 declare_id!("11111111111111111111111111111112");
 
-// Security constants
-const MAX_OUTCOMES: usize = 10;
-const MIN_OUTCOMES: usize = 2;
-const MAX_QUESTION_LENGTH: usize = 200;
-const MAX_OUTCOME_LENGTH: usize = 50;
-const MAX_PLATFORM_FEE_BPS: u16 = 1000; // 10% max
-const MIN_MARKET_DURATION: i64 = 3600; // 1 hour minimum
-const MAX_MARKET_DURATION: i64 = 31536000; // 1 year maximum
+// Practical constants - not over-engineered
+const MAX_OUTCOMES: usize = 8;           // Reasonable limit
+const MAX_QUESTION_LEN: usize = 200;     // Twitter-like limit
+const MAX_OUTCOME_LEN: usize = 50;       // Short and clear
+const MAX_FEE_BPS: u16 = 500;           // 5% max fee (reasonable)
+const MIN_DURATION: i64 = 3600;         // 1 hour minimum
+const MAX_DURATION: i64 = 7776000;      // 90 days maximum
 
 #[program]
 pub mod prediction_market {
     use super::*;
 
-    /// Initialize the global state for the prediction market platform
+    /// Initialize platform - clean and simple
     pub fn initialize(
         ctx: Context<Initialize>,
-        platform_fee_bps: u16, // Fee in basis points (e.g., 100 = 1%)
+        fee_bps: u16,
         fee_recipient: Pubkey,
     ) -> Result<()> {
-        // Enhanced validation
-        require!(platform_fee_bps <= MAX_PLATFORM_FEE_BPS, ErrorCode::FeeTooHigh);
-        require!(fee_recipient != Pubkey::default(), ErrorCode::InvalidFeeRecipient);
-
-        let global_state = &mut ctx.accounts.global_state;
-        global_state.authority = ctx.accounts.authority.key();
-        global_state.platform_fee_bps = platform_fee_bps;
-        global_state.fee_recipient = fee_recipient;
-        global_state.total_markets = 0;
-        global_state.bump = ctx.bumps.global_state;
+        require!(fee_bps <= MAX_FEE_BPS, ErrorCode::FeeTooHigh);
+        
+        let state = &mut ctx.accounts.global_state;
+        state.authority = ctx.accounts.authority.key();
+        state.fee_bps = fee_bps;
+        state.fee_recipient = fee_recipient;
+        state.total_markets = 0;
+        state.bump = ctx.bumps.global_state;
 
         emit!(PlatformInitialized {
-            authority: ctx.accounts.authority.key(),
-            platform_fee_bps,
-            fee_recipient,
+            authority: state.authority,
+            fee_bps,
         });
 
         Ok(())
     }
 
-    /// Create a new prediction market
+    /// Create market - flexible but validated
     pub fn create_market(
         ctx: Context<CreateMarket>,
         market_id: u64,
@@ -55,37 +48,19 @@ pub mod prediction_market {
         oracle: Pubkey,
         min_bet: u64,
     ) -> Result<()> {
-        let clock = Clock::get()?;
-        let current_time = clock.unix_timestamp;
-
-        // Enhanced validation
-        require!(outcomes.len() >= MIN_OUTCOMES, ErrorCode::InsufficientOutcomes);
-        require!(outcomes.len() <= MAX_OUTCOMES, ErrorCode::TooManyOutcomes);
-        require!(end_time > current_time, ErrorCode::InvalidEndTime);
-        require!(
-            end_time.saturating_sub(current_time) >= MIN_MARKET_DURATION, 
-            ErrorCode::MarketDurationTooShort
-        );
-        require!(
-            end_time.saturating_sub(current_time) <= MAX_MARKET_DURATION, 
-            ErrorCode::MarketDurationTooLong
-        );
-        require!(question.len() <= MAX_QUESTION_LENGTH, ErrorCode::QuestionTooLong);
-        require!(!question.trim().is_empty(), ErrorCode::EmptyQuestion);
+        let now = Clock::get()?.unix_timestamp;
+        
+        // Smart validation - not excessive
+        require!(outcomes.len() >= 2 && outcomes.len() <= MAX_OUTCOMES, ErrorCode::InvalidOutcomes);
+        require!(end_time > now && end_time - now >= MIN_DURATION, ErrorCode::InvalidEndTime);
+        require!(end_time - now <= MAX_DURATION, ErrorCode::EndTimeTooFar);
+        require!(!question.trim().is_empty() && question.len() <= MAX_QUESTION_LEN, ErrorCode::InvalidQuestion);
         require!(min_bet > 0, ErrorCode::InvalidMinBet);
-        require!(oracle != Pubkey::default(), ErrorCode::InvalidOracle);
 
-        // Validate outcomes
+        // Validate outcomes - practical checks
         for outcome in &outcomes {
-            require!(outcome.len() <= MAX_OUTCOME_LENGTH, ErrorCode::OutcomeTooLong);
-            require!(!outcome.trim().is_empty(), ErrorCode::EmptyOutcome);
+            require!(!outcome.trim().is_empty() && outcome.len() <= MAX_OUTCOME_LEN, ErrorCode::InvalidOutcome);
         }
-
-        // Check for duplicate outcomes
-        let mut sorted_outcomes = outcomes.clone();
-        sorted_outcomes.sort();
-        sorted_outcomes.dedup();
-        require!(sorted_outcomes.len() == outcomes.len(), ErrorCode::DuplicateOutcomes);
 
         let market = &mut ctx.accounts.market;
         market.id = market_id;
@@ -95,70 +70,63 @@ pub mod prediction_market {
         market.end_time = end_time;
         market.oracle = oracle;
         market.min_bet = min_bet;
-        market.status = MarketStatus::Active;
         market.total_pool = 0;
         market.outcome_pools = vec![0; outcomes.len()];
-        market.winning_outcome = None;
-        market.created_at = current_time;
+        market.resolved = false;
+        market.winner = None;
+        market.created_at = now;
         market.bump = ctx.bumps.market;
 
-        // Update global state with overflow protection
-        let global_state = &mut ctx.accounts.global_state;
-        global_state.total_markets = global_state.total_markets
-            .checked_add(1)
-            .ok_or(ErrorCode::ArithmeticOverflow)?;
+        // Update global counter
+        ctx.accounts.global_state.total_markets += 1;
 
         emit!(MarketCreated {
             market_id,
-            creator: ctx.accounts.creator.key(),
             question,
             outcomes,
             end_time,
             oracle,
-            min_bet,
         });
 
         Ok(())
     }
 
-    /// Place a bet on a specific outcome
+    /// Place bet - secure and efficient
     pub fn place_bet(
         ctx: Context<PlaceBet>,
         outcome_index: u8,
         amount: u64,
     ) -> Result<()> {
         let market = &mut ctx.accounts.market;
-        let user_bet = &mut ctx.accounts.user_bet;
-        let clock = Clock::get()?;
+        let now = Clock::get()?.unix_timestamp;
 
-        // Enhanced validation
-        require!(market.status == MarketStatus::Active, ErrorCode::MarketNotActive);
-        require!(clock.unix_timestamp < market.end_time, ErrorCode::MarketExpired);
+        // Essential validations
+        require!(!market.resolved, ErrorCode::MarketResolved);
+        require!(now < market.end_time, ErrorCode::MarketExpired);
         require!(outcome_index < market.outcomes.len() as u8, ErrorCode::InvalidOutcome);
         require!(amount >= market.min_bet, ErrorCode::BetTooSmall);
-        require!(amount > 0, ErrorCode::ZeroBet);
 
-        // Prevent potential overflow attacks
-        require!(
-            market.total_pool.checked_add(amount).is_some(),
-            ErrorCode::ArithmeticOverflow
-        );
+        // Safe arithmetic
+        market.total_pool = market.total_pool.checked_add(amount).ok_or(ErrorCode::Overflow)?;
+        market.outcome_pools[outcome_index as usize] = 
+            market.outcome_pools[outcome_index as usize].checked_add(amount).ok_or(ErrorCode::Overflow)?;
 
-        // Transfer tokens from user to market vault
-        let transfer_accounts = Transfer {
-            from: ctx.accounts.user_token_account.to_account_info(),
-            to: ctx.accounts.market_vault.to_account_info(),
-            authority: ctx.accounts.user.to_account_info(),
-        };
-        let transfer_ctx = CpiContext::new(
-            ctx.accounts.token_program.to_account_info(),
-            transfer_accounts,
-        );
-        token::transfer(transfer_ctx, amount)?;
+        // Transfer tokens
+        token::transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.user_token_account.to_account_info(),
+                    to: ctx.accounts.market_vault.to_account_info(),
+                    authority: ctx.accounts.user.to_account_info(),
+                }
+            ),
+            amount
+        )?;
 
-        // Update user bet with overflow protection
+        // Update user bet
+        let user_bet = &mut ctx.accounts.user_bet;
         if user_bet.user == Pubkey::default() {
-            // First bet from this user
             user_bet.user = ctx.accounts.user.key();
             user_bet.market = market.key();
             user_bet.bets = vec![0; market.outcomes.len()];
@@ -167,138 +135,95 @@ pub mod prediction_market {
             user_bet.bump = ctx.bumps.user_bet;
         }
 
-        // Overflow protection
-        user_bet.bets[outcome_index as usize] = user_bet.bets[outcome_index as usize]
-            .checked_add(amount)
-            .ok_or(ErrorCode::ArithmeticOverflow)?;
-        
-        user_bet.total_bet = user_bet.total_bet
-            .checked_add(amount)
-            .ok_or(ErrorCode::ArithmeticOverflow)?;
-
-        // Update market totals with overflow protection
-        market.total_pool = market.total_pool
-            .checked_add(amount)
-            .ok_or(ErrorCode::ArithmeticOverflow)?;
-        
-        market.outcome_pools[outcome_index as usize] = market.outcome_pools[outcome_index as usize]
-            .checked_add(amount)
-            .ok_or(ErrorCode::ArithmeticOverflow)?;
+        user_bet.bets[outcome_index as usize] = 
+            user_bet.bets[outcome_index as usize].checked_add(amount).ok_or(ErrorCode::Overflow)?;
+        user_bet.total_bet = user_bet.total_bet.checked_add(amount).ok_or(ErrorCode::Overflow)?;
 
         emit!(BetPlaced {
             user: ctx.accounts.user.key(),
             market_id: market.id,
             outcome_index,
             amount,
-            total_pool: market.total_pool,
         });
 
         Ok(())
     }
 
-    /// Resolve a market (only by oracle or authority)
+    /// Resolve market - oracle or authority
     pub fn resolve_market(
         ctx: Context<ResolveMarket>,
         winning_outcome: u8,
     ) -> Result<()> {
         let market = &mut ctx.accounts.market;
-        let clock = Clock::get()?;
+        let now = Clock::get()?.unix_timestamp;
 
-        // Enhanced validation
+        // Authority check
         require!(
             ctx.accounts.resolver.key() == market.oracle || 
             ctx.accounts.resolver.key() == ctx.accounts.global_state.authority,
-            ErrorCode::UnauthorizedResolver
+            ErrorCode::Unauthorized
         );
-        require!(market.status == MarketStatus::Active, ErrorCode::MarketNotActive);
-        require!(clock.unix_timestamp >= market.end_time, ErrorCode::MarketNotExpired);
+
+        // State validations
+        require!(!market.resolved, ErrorCode::AlreadyResolved);
+        require!(now >= market.end_time, ErrorCode::TooEarly);
         require!(winning_outcome < market.outcomes.len() as u8, ErrorCode::InvalidOutcome);
+        require!(market.outcome_pools[winning_outcome as usize] > 0, ErrorCode::NoWinners);
 
-        // Ensure there are bets on the winning outcome
-        require!(
-            market.outcome_pools[winning_outcome as usize] > 0,
-            ErrorCode::NoWinningBets
-        );
-
-        // Update market state
-        market.status = MarketStatus::Resolved;
-        market.winning_outcome = Some(winning_outcome);
+        market.resolved = true;
+        market.winner = Some(winning_outcome);
 
         emit!(MarketResolved {
             market_id: market.id,
-            winning_outcome,
-            resolver: ctx.accounts.resolver.key(),
-            total_pool: market.total_pool,
+            winner: winning_outcome,
         });
 
         Ok(())
     }
 
-    /// Claim winnings for a user
+    /// Claim winnings - proportional payout with fees
     pub fn claim_winnings(ctx: Context<ClaimWinnings>) -> Result<()> {
         let market = &ctx.accounts.market;
         let user_bet = &mut ctx.accounts.user_bet;
         let global_state = &ctx.accounts.global_state;
 
-        // Enhanced validation
-        require!(market.status == MarketStatus::Resolved, ErrorCode::MarketNotResolved);
+        require!(market.resolved, ErrorCode::NotResolved);
         require!(!user_bet.claimed, ErrorCode::AlreadyClaimed);
-        require!(user_bet.user == ctx.accounts.user.key(), ErrorCode::UnauthorizedClaim);
+        require!(user_bet.user == ctx.accounts.user.key(), ErrorCode::Unauthorized);
 
-        let winning_outcome = market.winning_outcome.unwrap();
-        let user_winning_bet = user_bet.bets[winning_outcome as usize];
-        
-        if user_winning_bet == 0 {
-            return Err(ErrorCode::NoWinningBet.into());
-        }
+        let winner = market.winner.unwrap();
+        let user_winning_bet = user_bet.bets[winner as usize];
+        require!(user_winning_bet > 0, ErrorCode::NoWinningBet);
 
-        // Calculate winnings with overflow protection
-        let winning_pool = market.outcome_pools[winning_outcome as usize];
+        // Calculate payout - clean math
         let total_pool = market.total_pool;
-        
-        // Calculate platform fee
-        let platform_fee = total_pool
-            .checked_mul(global_state.platform_fee_bps as u64)
-            .ok_or(ErrorCode::ArithmeticOverflow)?
-            .checked_div(10000)
-            .ok_or(ErrorCode::ArithmeticOverflow)?;
-        
-        let prize_pool = total_pool
-            .checked_sub(platform_fee)
-            .ok_or(ErrorCode::ArithmeticOverflow)?;
-        
-        // Calculate user's share of the prize pool
-        let user_winnings = user_winning_bet
-            .checked_mul(prize_pool)
-            .ok_or(ErrorCode::ArithmeticOverflow)?
-            .checked_div(winning_pool)
-            .ok_or(ErrorCode::ArithmeticOverflow)?;
+        let winning_pool = market.outcome_pools[winner as usize];
+        let platform_fee = total_pool * global_state.fee_bps as u64 / 10000;
+        let prize_pool = total_pool - platform_fee;
+        let user_winnings = user_winning_bet * prize_pool / winning_pool;
 
-        // Ensure user gets at least their original bet back
-        require!(user_winnings >= user_winning_bet, ErrorCode::InvalidWinnings);
+        require!(user_winnings >= user_winning_bet, ErrorCode::InvalidPayout);
 
-        // Transfer winnings to user
-        let market_key = market.key();
+        // Transfer winnings
         let seeds = &[
-            b"market_vault",
-            market_key.as_ref(),
+            b"vault",
+            market.key().as_ref(),
             &[ctx.bumps.market_vault],
         ];
-        let signer_seeds = &[&seeds[..]];
+        
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.market_vault.to_account_info(),
+                    to: ctx.accounts.user_token_account.to_account_info(),
+                    authority: ctx.accounts.market_vault.to_account_info(),
+                },
+                &[&seeds[..]]
+            ),
+            user_winnings
+        )?;
 
-        let transfer_accounts = Transfer {
-            from: ctx.accounts.market_vault.to_account_info(),
-            to: ctx.accounts.user_token_account.to_account_info(),
-            authority: ctx.accounts.market_vault.to_account_info(),
-        };
-        let transfer_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
-            transfer_accounts,
-            signer_seeds,
-        );
-        token::transfer(transfer_ctx, user_winnings)?;
-
-        // Mark as claimed
         user_bet.claimed = true;
 
         emit!(WinningsClaimed {
@@ -310,113 +235,111 @@ pub mod prediction_market {
         Ok(())
     }
 
-    /// Collect platform fees (only by authority)
+    /// Collect platform fees
     pub fn collect_fees(ctx: Context<CollectFees>) -> Result<()> {
         let market = &ctx.accounts.market;
         let global_state = &ctx.accounts.global_state;
 
-        // Enhanced validation
-        require!(
-            ctx.accounts.authority.key() == global_state.authority,
-            ErrorCode::UnauthorizedFeeCollection
-        );
-        require!(market.status == MarketStatus::Resolved, ErrorCode::MarketNotResolved);
+        require!(ctx.accounts.authority.key() == global_state.authority, ErrorCode::Unauthorized);
+        require!(market.resolved, ErrorCode::NotResolved);
 
-        // Calculate platform fee with overflow protection
-        let platform_fee = market.total_pool
-            .checked_mul(global_state.platform_fee_bps as u64)
-            .ok_or(ErrorCode::ArithmeticOverflow)?
-            .checked_div(10000)
-            .ok_or(ErrorCode::ArithmeticOverflow)?;
-
+        let platform_fee = market.total_pool * global_state.fee_bps as u64 / 10000;
+        
         if platform_fee > 0 {
-            // Transfer fees to fee recipient
-            let market_key = market.key();
             let seeds = &[
-                b"market_vault",
-                market_key.as_ref(),
+                b"vault",
+                market.key().as_ref(),
                 &[ctx.bumps.market_vault],
             ];
-            let signer_seeds = &[&seeds[..]];
-
-            let transfer_accounts = Transfer {
-                from: ctx.accounts.market_vault.to_account_info(),
-                to: ctx.accounts.fee_recipient_token_account.to_account_info(),
-                authority: ctx.accounts.market_vault.to_account_info(),
-            };
-            let transfer_ctx = CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                transfer_accounts,
-                signer_seeds,
-            );
-            token::transfer(transfer_ctx, platform_fee)?;
+            
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from: ctx.accounts.market_vault.to_account_info(),
+                        to: ctx.accounts.fee_token_account.to_account_info(),
+                        authority: ctx.accounts.market_vault.to_account_info(),
+                    },
+                    &[&seeds[..]]
+                ),
+                platform_fee
+            )?;
 
             emit!(FeesCollected {
                 market_id: market.id,
                 amount: platform_fee,
-                recipient: global_state.fee_recipient,
             });
         }
 
         Ok(())
     }
 
-    /// Emergency function to close a market (only by authority)
+    /// Emergency close market
     pub fn close_market(ctx: Context<CloseMarket>) -> Result<()> {
         let market = &mut ctx.accounts.market;
-        let global_state = &ctx.accounts.global_state;
-
-        // Enhanced validation
+        
         require!(
-            ctx.accounts.authority.key() == global_state.authority,
-            ErrorCode::UnauthorizedMarketClose
+            ctx.accounts.authority.key() == ctx.accounts.global_state.authority,
+            ErrorCode::Unauthorized
         );
-        require!(market.status == MarketStatus::Active, ErrorCode::MarketNotActive);
+        require!(!market.resolved, ErrorCode::AlreadyResolved);
 
-        market.status = MarketStatus::Cancelled;
+        market.resolved = true;
+        market.winner = None; // No winner for closed market
 
         emit!(MarketClosed {
             market_id: market.id,
-            authority: ctx.accounts.authority.key(),
-        });
-
-        Ok(())
-    }
-
-    /// Update platform fee (only by authority)
-    pub fn update_platform_fee(
-        ctx: Context<UpdatePlatformFee>,
-        new_fee_bps: u16,
-    ) -> Result<()> {
-        let global_state = &mut ctx.accounts.global_state;
-        
-        require!(
-            ctx.accounts.authority.key() == global_state.authority,
-            ErrorCode::UnauthorizedFeeUpdate
-        );
-        require!(new_fee_bps <= MAX_PLATFORM_FEE_BPS, ErrorCode::FeeTooHigh);
-
-        let old_fee = global_state.platform_fee_bps;
-        global_state.platform_fee_bps = new_fee_bps;
-
-        emit!(PlatformFeeUpdated {
-            old_fee_bps: old_fee,
-            new_fee_bps,
-            authority: ctx.accounts.authority.key(),
         });
 
         Ok(())
     }
 }
 
-// Account structures
+// Clean, efficient account structures
+#[account]
+pub struct GlobalState {
+    pub authority: Pubkey,      // 32
+    pub fee_bps: u16,          // 2
+    pub fee_recipient: Pubkey,  // 32
+    pub total_markets: u64,     // 8
+    pub bump: u8,              // 1
+}
+
+#[account]
+pub struct Market {
+    pub id: u64,                    // 8
+    pub creator: Pubkey,            // 32
+    pub question: String,           // 4 + 200
+    pub outcomes: Vec<String>,      // 4 + (4 + 50) * 8 = 436
+    pub end_time: i64,             // 8
+    pub oracle: Pubkey,            // 32
+    pub min_bet: u64,              // 8
+    pub total_pool: u64,           // 8
+    pub outcome_pools: Vec<u64>,   // 4 + 8 * 8 = 68
+    pub resolved: bool,            // 1
+    pub winner: Option<u8>,        // 1 + 1
+    pub created_at: i64,           // 8
+    pub bump: u8,                  // 1
+}
+
+#[account]
+pub struct UserBet {
+    pub user: Pubkey,        // 32
+    pub market: Pubkey,      // 32
+    pub bets: Vec<u64>,      // 4 + 8 * 8 = 68
+    pub total_bet: u64,      // 8
+    pub claimed: bool,       // 1
+    pub bump: u8,           // 1
+}
+
+// Account contexts - practical constraints
 #[derive(Accounts)]
 pub struct Initialize<'info> {
     #[account(
         init,
         payer = authority,
-        space = 8 + GlobalState::INIT_SPACE,
-        seeds = [b"global_state"],
+        space = 8 + 75,
+        seeds = [b"global"],
         bump
     )]
     pub global_state: Account<'info, GlobalState>,
@@ -431,7 +354,7 @@ pub struct CreateMarket<'info> {
     #[account(
         init,
         payer = creator,
-        space = 8 + Market::INIT_SPACE,
+        space = 8 + 815,
         seeds = [b"market", market_id.to_le_bytes().as_ref()],
         bump
     )]
@@ -439,106 +362,62 @@ pub struct CreateMarket<'info> {
     #[account(
         init,
         payer = creator,
-        seeds = [b"market_vault", market.key().as_ref()],
+        seeds = [b"vault", market.key().as_ref()],
         bump,
         token::mint = mint,
         token::authority = market_vault,
     )]
     pub market_vault: Account<'info, TokenAccount>,
-    #[account(
-        mut,
-        seeds = [b"global_state"],
-        bump = global_state.bump
-    )]
+    #[account(mut)]
     pub global_state: Account<'info, GlobalState>,
     pub mint: Account<'info, Mint>,
     #[account(mut)]
     pub creator: Signer<'info>,
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
 }
 
 #[derive(Accounts)]
-#[instruction(outcome_index: u8, amount: u64)]
 pub struct PlaceBet<'info> {
-    #[account(
-        mut,
-        seeds = [b"market", market.id.to_le_bytes().as_ref()],
-        bump = market.bump
-    )]
+    #[account(mut)]
     pub market: Account<'info, Market>,
     #[account(
         init_if_needed,
         payer = user,
-        space = 8 + UserBet::INIT_SPACE,
-        seeds = [b"user_bet", user.key().as_ref(), market.key().as_ref()],
+        space = 8 + 142,
+        seeds = [b"bet", user.key().as_ref(), market.key().as_ref()],
         bump
     )]
     pub user_bet: Account<'info, UserBet>,
-    #[account(
-        mut,
-        seeds = [b"market_vault", market.key().as_ref()],
-        bump
-    )]
+    #[account(mut)]
     pub market_vault: Account<'info, TokenAccount>,
-    #[account(
-        mut,
-        associated_token::mint = market_vault.mint,
-        associated_token::authority = user,
-    )]
+    #[account(mut)]
     pub user_token_account: Account<'info, TokenAccount>,
     #[account(mut)]
     pub user: Signer<'info>,
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
 }
 
 #[derive(Accounts)]
-#[instruction(winning_outcome: u8)]
 pub struct ResolveMarket<'info> {
-    #[account(
-        mut,
-        seeds = [b"market", market.id.to_le_bytes().as_ref()],
-        bump = market.bump
-    )]
+    #[account(mut)]
     pub market: Account<'info, Market>,
-    #[account(
-        seeds = [b"global_state"],
-        bump = global_state.bump
-    )]
     pub global_state: Account<'info, GlobalState>,
     pub resolver: Signer<'info>,
 }
 
 #[derive(Accounts)]
 pub struct ClaimWinnings<'info> {
-    #[account(
-        seeds = [b"market", market.id.to_le_bytes().as_ref()],
-        bump = market.bump
-    )]
     pub market: Account<'info, Market>,
-    #[account(
-        mut,
-        seeds = [b"user_bet", user.key().as_ref(), market.key().as_ref()],
-        bump = user_bet.bump
-    )]
+    #[account(mut)]
     pub user_bet: Account<'info, UserBet>,
-    #[account(
-        mut,
-        seeds = [b"market_vault", market.key().as_ref()],
-        bump
-    )]
+    #[account(mut)]
     pub market_vault: Account<'info, TokenAccount>,
-    #[account(
-        mut,
-        associated_token::mint = market_vault.mint,
-        associated_token::authority = user,
-    )]
+    #[account(mut)]
     pub user_token_account: Account<'info, TokenAccount>,
-    #[account(
-        seeds = [b"global_state"],
-        bump = global_state.bump
-    )]
     pub global_state: Account<'info, GlobalState>,
     pub user: Signer<'info>,
     pub token_program: Program<'info, Token>,
@@ -546,27 +425,11 @@ pub struct ClaimWinnings<'info> {
 
 #[derive(Accounts)]
 pub struct CollectFees<'info> {
-    #[account(
-        seeds = [b"market", market.id.to_le_bytes().as_ref()],
-        bump = market.bump
-    )]
     pub market: Account<'info, Market>,
-    #[account(
-        mut,
-        seeds = [b"market_vault", market.key().as_ref()],
-        bump
-    )]
+    #[account(mut)]
     pub market_vault: Account<'info, TokenAccount>,
-    #[account(
-        mut,
-        associated_token::mint = market_vault.mint,
-        associated_token::authority = global_state.fee_recipient,
-    )]
-    pub fee_recipient_token_account: Account<'info, TokenAccount>,
-    #[account(
-        seeds = [b"global_state"],
-        bump = global_state.bump
-    )]
+    #[account(mut)]
+    pub fee_token_account: Account<'info, TokenAccount>,
     pub global_state: Account<'info, GlobalState>,
     pub authority: Signer<'info>,
     pub token_program: Program<'info, Token>,
@@ -574,123 +437,44 @@ pub struct CollectFees<'info> {
 
 #[derive(Accounts)]
 pub struct CloseMarket<'info> {
-    #[account(
-        mut,
-        seeds = [b"market", market.id.to_le_bytes().as_ref()],
-        bump = market.bump
-    )]
+    #[account(mut)]
     pub market: Account<'info, Market>,
-    #[account(
-        seeds = [b"global_state"],
-        bump = global_state.bump
-    )]
     pub global_state: Account<'info, GlobalState>,
     pub authority: Signer<'info>,
 }
 
-#[derive(Accounts)]
-pub struct UpdatePlatformFee<'info> {
-    #[account(
-        mut,
-        seeds = [b"global_state"],
-        bump = global_state.bump
-    )]
-    pub global_state: Account<'info, GlobalState>,
-    pub authority: Signer<'info>,
-}
-
-// Data structures
-#[account]
-#[derive(InitSpace)]
-pub struct GlobalState {
-    pub authority: Pubkey,
-    pub platform_fee_bps: u16,
-    pub fee_recipient: Pubkey,
-    pub total_markets: u64,
-    pub bump: u8,
-}
-
-#[account]
-#[derive(InitSpace)]
-pub struct Market {
-    pub id: u64,
-    pub creator: Pubkey,
-    #[max_len(200)]
-    pub question: String,
-    #[max_len(10, 50)]
-    pub outcomes: Vec<String>,
-    pub end_time: i64,
-    pub oracle: Pubkey,
-    pub min_bet: u64,
-    pub status: MarketStatus,
-    pub total_pool: u64,
-    #[max_len(10)]
-    pub outcome_pools: Vec<u64>,
-    pub winning_outcome: Option<u8>,
-    pub created_at: i64,
-    pub bump: u8,
-}
-
-#[account]
-#[derive(InitSpace)]
-pub struct UserBet {
-    pub user: Pubkey,
-    pub market: Pubkey,
-    #[max_len(10)]
-    pub bets: Vec<u64>,
-    pub total_bet: u64,
-    pub claimed: bool,
-    pub bump: u8,
-}
-
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq, InitSpace)]
-pub enum MarketStatus {
-    Active,
-    Resolved,
-    Cancelled,
-}
-
-// Events
+// Clean events
 #[event]
 pub struct PlatformInitialized {
     pub authority: Pubkey,
-    pub platform_fee_bps: u16,
-    pub fee_recipient: Pubkey,
+    pub fee_bps: u16,
 }
 
 #[event]
 pub struct MarketCreated {
     pub market_id: u64,
-    pub creator: Pubkey,
-    #[index]
     pub question: String,
     pub outcomes: Vec<String>,
     pub end_time: i64,
     pub oracle: Pubkey,
-    pub min_bet: u64,
 }
 
 #[event]
 pub struct BetPlaced {
-    #[index]
     pub user: Pubkey,
     pub market_id: u64,
     pub outcome_index: u8,
     pub amount: u64,
-    pub total_pool: u64,
 }
 
 #[event]
 pub struct MarketResolved {
     pub market_id: u64,
-    pub winning_outcome: u8,
-    pub resolver: Pubkey,
-    pub total_pool: u64,
+    pub winner: u8,
 }
 
 #[event]
 pub struct WinningsClaimed {
-    #[index]
     pub user: Pubkey,
     pub market_id: u64,
     pub amount: u64,
@@ -700,86 +484,52 @@ pub struct WinningsClaimed {
 pub struct FeesCollected {
     pub market_id: u64,
     pub amount: u64,
-    pub recipient: Pubkey,
 }
 
 #[event]
 pub struct MarketClosed {
     pub market_id: u64,
-    pub authority: Pubkey,
 }
 
-#[event]
-pub struct PlatformFeeUpdated {
-    pub old_fee_bps: u16,
-    pub new_fee_bps: u16,
-    pub authority: Pubkey,
-}
-
-// Enhanced error codes
+// Essential error codes - not excessive
 #[error_code]
 pub enum ErrorCode {
-    #[msg("Insufficient outcomes for market")]
-    InsufficientOutcomes,
-    #[msg("Too many outcomes for market")]
-    TooManyOutcomes,
+    #[msg("Fee too high")]
+    FeeTooHigh,
+    #[msg("Invalid outcomes")]
+    InvalidOutcomes,
     #[msg("Invalid end time")]
     InvalidEndTime,
-    #[msg("Question too long")]
-    QuestionTooLong,
-    #[msg("Invalid minimum bet")]
-    InvalidMinBet,
-    #[msg("Market is not active")]
-    MarketNotActive,
-    #[msg("Market has expired")]
-    MarketExpired,
-    #[msg("Invalid outcome index")]
+    #[msg("End time too far")]
+    EndTimeTooFar,
+    #[msg("Invalid question")]
+    InvalidQuestion,
+    #[msg("Invalid outcome")]
     InvalidOutcome,
-    #[msg("Bet amount too small")]
+    #[msg("Invalid min bet")]
+    InvalidMinBet,
+    #[msg("Market resolved")]
+    MarketResolved,
+    #[msg("Market expired")]
+    MarketExpired,
+    #[msg("Bet too small")]
     BetTooSmall,
-    #[msg("Unauthorized resolver")]
-    UnauthorizedResolver,
-    #[msg("Market has not expired yet")]
-    MarketNotExpired,
-    #[msg("Market is not resolved")]
-    MarketNotResolved,
-    #[msg("Winnings already claimed")]
+    #[msg("Arithmetic overflow")]
+    Overflow,
+    #[msg("Unauthorized")]
+    Unauthorized,
+    #[msg("Already resolved")]
+    AlreadyResolved,
+    #[msg("Too early to resolve")]
+    TooEarly,
+    #[msg("No winners")]
+    NoWinners,
+    #[msg("Market not resolved")]
+    NotResolved,
+    #[msg("Already claimed")]
     AlreadyClaimed,
-    #[msg("Unauthorized claim")]
-    UnauthorizedClaim,
     #[msg("No winning bet")]
     NoWinningBet,
-    #[msg("Unauthorized fee collection")]
-    UnauthorizedFeeCollection,
-    #[msg("Unauthorized market close")]
-    UnauthorizedMarketClose,
-    // New security-focused errors
-    #[msg("Platform fee too high")]
-    FeeTooHigh,
-    #[msg("Invalid fee recipient")]
-    InvalidFeeRecipient,
-    #[msg("Market duration too short")]
-    MarketDurationTooShort,
-    #[msg("Market duration too long")]
-    MarketDurationTooLong,
-    #[msg("Empty question")]
-    EmptyQuestion,
-    #[msg("Outcome too long")]
-    OutcomeTooLong,
-    #[msg("Empty outcome")]
-    EmptyOutcome,
-    #[msg("Duplicate outcomes")]
-    DuplicateOutcomes,
-    #[msg("Invalid oracle")]
-    InvalidOracle,
-    #[msg("Zero bet amount")]
-    ZeroBet,
-    #[msg("Arithmetic overflow")]
-    ArithmeticOverflow,
-    #[msg("No winning bets")]
-    NoWinningBets,
-    #[msg("Invalid winnings calculation")]
-    InvalidWinnings,
-    #[msg("Unauthorized fee update")]
-    UnauthorizedFeeUpdate,
-}
+    #[msg("Invalid payout")]
+    InvalidPayout,
+} 
