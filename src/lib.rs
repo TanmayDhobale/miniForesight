@@ -6,6 +6,15 @@ use anchor_spl::{
 
 declare_id!("11111111111111111111111111111112");
 
+// Security constants
+const MAX_OUTCOMES: usize = 10;
+const MIN_OUTCOMES: usize = 2;
+const MAX_QUESTION_LENGTH: usize = 200;
+const MAX_OUTCOME_LENGTH: usize = 50;
+const MAX_PLATFORM_FEE_BPS: u16 = 1000; // 10% max
+const MIN_MARKET_DURATION: i64 = 3600; // 1 hour minimum
+const MAX_MARKET_DURATION: i64 = 31536000; // 1 year maximum
+
 #[program]
 pub mod prediction_market {
     use super::*;
@@ -16,6 +25,10 @@ pub mod prediction_market {
         platform_fee_bps: u16, // Fee in basis points (e.g., 100 = 1%)
         fee_recipient: Pubkey,
     ) -> Result<()> {
+        // Enhanced validation
+        require!(platform_fee_bps <= MAX_PLATFORM_FEE_BPS, ErrorCode::FeeTooHigh);
+        require!(fee_recipient != Pubkey::default(), ErrorCode::InvalidFeeRecipient);
+
         let global_state = &mut ctx.accounts.global_state;
         global_state.authority = ctx.accounts.authority.key();
         global_state.platform_fee_bps = platform_fee_bps;
@@ -42,11 +55,37 @@ pub mod prediction_market {
         oracle: Pubkey,
         min_bet: u64,
     ) -> Result<()> {
-        require!(outcomes.len() >= 2, ErrorCode::InsufficientOutcomes);
-        require!(outcomes.len() <= 10, ErrorCode::TooManyOutcomes);
-        require!(end_time > Clock::get()?.unix_timestamp, ErrorCode::InvalidEndTime);
-        require!(question.len() <= 200, ErrorCode::QuestionTooLong);
+        let clock = Clock::get()?;
+        let current_time = clock.unix_timestamp;
+
+        // Enhanced validation
+        require!(outcomes.len() >= MIN_OUTCOMES, ErrorCode::InsufficientOutcomes);
+        require!(outcomes.len() <= MAX_OUTCOMES, ErrorCode::TooManyOutcomes);
+        require!(end_time > current_time, ErrorCode::InvalidEndTime);
+        require!(
+            end_time.saturating_sub(current_time) >= MIN_MARKET_DURATION, 
+            ErrorCode::MarketDurationTooShort
+        );
+        require!(
+            end_time.saturating_sub(current_time) <= MAX_MARKET_DURATION, 
+            ErrorCode::MarketDurationTooLong
+        );
+        require!(question.len() <= MAX_QUESTION_LENGTH, ErrorCode::QuestionTooLong);
+        require!(!question.trim().is_empty(), ErrorCode::EmptyQuestion);
         require!(min_bet > 0, ErrorCode::InvalidMinBet);
+        require!(oracle != Pubkey::default(), ErrorCode::InvalidOracle);
+
+        // Validate outcomes
+        for outcome in &outcomes {
+            require!(outcome.len() <= MAX_OUTCOME_LENGTH, ErrorCode::OutcomeTooLong);
+            require!(!outcome.trim().is_empty(), ErrorCode::EmptyOutcome);
+        }
+
+        // Check for duplicate outcomes
+        let mut sorted_outcomes = outcomes.clone();
+        sorted_outcomes.sort();
+        sorted_outcomes.dedup();
+        require!(sorted_outcomes.len() == outcomes.len(), ErrorCode::DuplicateOutcomes);
 
         let market = &mut ctx.accounts.market;
         market.id = market_id;
@@ -60,12 +99,14 @@ pub mod prediction_market {
         market.total_pool = 0;
         market.outcome_pools = vec![0; outcomes.len()];
         market.winning_outcome = None;
-        market.created_at = Clock::get()?.unix_timestamp;
+        market.created_at = current_time;
         market.bump = ctx.bumps.market;
 
-        // Update global state
+        // Update global state with overflow protection
         let global_state = &mut ctx.accounts.global_state;
-        global_state.total_markets += 1;
+        global_state.total_markets = global_state.total_markets
+            .checked_add(1)
+            .ok_or(ErrorCode::ArithmeticOverflow)?;
 
         emit!(MarketCreated {
             market_id,
@@ -90,11 +131,18 @@ pub mod prediction_market {
         let user_bet = &mut ctx.accounts.user_bet;
         let clock = Clock::get()?;
 
-        // Validate market state
+        // Enhanced validation
         require!(market.status == MarketStatus::Active, ErrorCode::MarketNotActive);
         require!(clock.unix_timestamp < market.end_time, ErrorCode::MarketExpired);
         require!(outcome_index < market.outcomes.len() as u8, ErrorCode::InvalidOutcome);
         require!(amount >= market.min_bet, ErrorCode::BetTooSmall);
+        require!(amount > 0, ErrorCode::ZeroBet);
+
+        // Prevent potential overflow attacks
+        require!(
+            market.total_pool.checked_add(amount).is_some(),
+            ErrorCode::ArithmeticOverflow
+        );
 
         // Transfer tokens from user to market vault
         let transfer_accounts = Transfer {
@@ -108,7 +156,7 @@ pub mod prediction_market {
         );
         token::transfer(transfer_ctx, amount)?;
 
-        // Update user bet
+        // Update user bet with overflow protection
         if user_bet.user == Pubkey::default() {
             // First bet from this user
             user_bet.user = ctx.accounts.user.key();
@@ -119,12 +167,23 @@ pub mod prediction_market {
             user_bet.bump = ctx.bumps.user_bet;
         }
 
-        user_bet.bets[outcome_index as usize] += amount;
-        user_bet.total_bet += amount;
+        // Overflow protection
+        user_bet.bets[outcome_index as usize] = user_bet.bets[outcome_index as usize]
+            .checked_add(amount)
+            .ok_or(ErrorCode::ArithmeticOverflow)?;
+        
+        user_bet.total_bet = user_bet.total_bet
+            .checked_add(amount)
+            .ok_or(ErrorCode::ArithmeticOverflow)?;
 
-        // Update market totals
-        market.total_pool += amount;
-        market.outcome_pools[outcome_index as usize] += amount;
+        // Update market totals with overflow protection
+        market.total_pool = market.total_pool
+            .checked_add(amount)
+            .ok_or(ErrorCode::ArithmeticOverflow)?;
+        
+        market.outcome_pools[outcome_index as usize] = market.outcome_pools[outcome_index as usize]
+            .checked_add(amount)
+            .ok_or(ErrorCode::ArithmeticOverflow)?;
 
         emit!(BetPlaced {
             user: ctx.accounts.user.key(),
@@ -145,17 +204,21 @@ pub mod prediction_market {
         let market = &mut ctx.accounts.market;
         let clock = Clock::get()?;
 
-        // Validate permissions
+        // Enhanced validation
         require!(
             ctx.accounts.resolver.key() == market.oracle || 
             ctx.accounts.resolver.key() == ctx.accounts.global_state.authority,
             ErrorCode::UnauthorizedResolver
         );
-
-        // Validate market state
         require!(market.status == MarketStatus::Active, ErrorCode::MarketNotActive);
         require!(clock.unix_timestamp >= market.end_time, ErrorCode::MarketNotExpired);
         require!(winning_outcome < market.outcomes.len() as u8, ErrorCode::InvalidOutcome);
+
+        // Ensure there are bets on the winning outcome
+        require!(
+            market.outcome_pools[winning_outcome as usize] > 0,
+            ErrorCode::NoWinningBets
+        );
 
         // Update market state
         market.status = MarketStatus::Resolved;
@@ -177,7 +240,7 @@ pub mod prediction_market {
         let user_bet = &mut ctx.accounts.user_bet;
         let global_state = &ctx.accounts.global_state;
 
-        // Validate market state
+        // Enhanced validation
         require!(market.status == MarketStatus::Resolved, ErrorCode::MarketNotResolved);
         require!(!user_bet.claimed, ErrorCode::AlreadyClaimed);
         require!(user_bet.user == ctx.accounts.user.key(), ErrorCode::UnauthorizedClaim);
@@ -189,16 +252,30 @@ pub mod prediction_market {
             return Err(ErrorCode::NoWinningBet.into());
         }
 
-        // Calculate winnings
+        // Calculate winnings with overflow protection
         let winning_pool = market.outcome_pools[winning_outcome as usize];
         let total_pool = market.total_pool;
         
         // Calculate platform fee
-        let platform_fee = (total_pool * global_state.platform_fee_bps as u64) / 10000;
-        let prize_pool = total_pool - platform_fee;
+        let platform_fee = total_pool
+            .checked_mul(global_state.platform_fee_bps as u64)
+            .ok_or(ErrorCode::ArithmeticOverflow)?
+            .checked_div(10000)
+            .ok_or(ErrorCode::ArithmeticOverflow)?;
+        
+        let prize_pool = total_pool
+            .checked_sub(platform_fee)
+            .ok_or(ErrorCode::ArithmeticOverflow)?;
         
         // Calculate user's share of the prize pool
-        let user_winnings = (user_winning_bet * prize_pool) / winning_pool;
+        let user_winnings = user_winning_bet
+            .checked_mul(prize_pool)
+            .ok_or(ErrorCode::ArithmeticOverflow)?
+            .checked_div(winning_pool)
+            .ok_or(ErrorCode::ArithmeticOverflow)?;
+
+        // Ensure user gets at least their original bet back
+        require!(user_winnings >= user_winning_bet, ErrorCode::InvalidWinnings);
 
         // Transfer winnings to user
         let market_key = market.key();
@@ -238,17 +315,19 @@ pub mod prediction_market {
         let market = &ctx.accounts.market;
         let global_state = &ctx.accounts.global_state;
 
-        // Validate permissions
+        // Enhanced validation
         require!(
             ctx.accounts.authority.key() == global_state.authority,
             ErrorCode::UnauthorizedFeeCollection
         );
-
-        // Validate market state
         require!(market.status == MarketStatus::Resolved, ErrorCode::MarketNotResolved);
 
-        // Calculate platform fee
-        let platform_fee = (market.total_pool * global_state.platform_fee_bps as u64) / 10000;
+        // Calculate platform fee with overflow protection
+        let platform_fee = market.total_pool
+            .checked_mul(global_state.platform_fee_bps as u64)
+            .ok_or(ErrorCode::ArithmeticOverflow)?
+            .checked_div(10000)
+            .ok_or(ErrorCode::ArithmeticOverflow)?;
 
         if platform_fee > 0 {
             // Transfer fees to fee recipient
@@ -287,16 +366,42 @@ pub mod prediction_market {
         let market = &mut ctx.accounts.market;
         let global_state = &ctx.accounts.global_state;
 
-        // Validate permissions
+        // Enhanced validation
         require!(
             ctx.accounts.authority.key() == global_state.authority,
             ErrorCode::UnauthorizedMarketClose
         );
+        require!(market.status == MarketStatus::Active, ErrorCode::MarketNotActive);
 
         market.status = MarketStatus::Cancelled;
 
         emit!(MarketClosed {
             market_id: market.id,
+            authority: ctx.accounts.authority.key(),
+        });
+
+        Ok(())
+    }
+
+    /// Update platform fee (only by authority)
+    pub fn update_platform_fee(
+        ctx: Context<UpdatePlatformFee>,
+        new_fee_bps: u16,
+    ) -> Result<()> {
+        let global_state = &mut ctx.accounts.global_state;
+        
+        require!(
+            ctx.accounts.authority.key() == global_state.authority,
+            ErrorCode::UnauthorizedFeeUpdate
+        );
+        require!(new_fee_bps <= MAX_PLATFORM_FEE_BPS, ErrorCode::FeeTooHigh);
+
+        let old_fee = global_state.platform_fee_bps;
+        global_state.platform_fee_bps = new_fee_bps;
+
+        emit!(PlatformFeeUpdated {
+            old_fee_bps: old_fee,
+            new_fee_bps,
             authority: ctx.accounts.authority.key(),
         });
 
@@ -483,6 +588,17 @@ pub struct CloseMarket<'info> {
     pub authority: Signer<'info>,
 }
 
+#[derive(Accounts)]
+pub struct UpdatePlatformFee<'info> {
+    #[account(
+        mut,
+        seeds = [b"global_state"],
+        bump = global_state.bump
+    )]
+    pub global_state: Account<'info, GlobalState>,
+    pub authority: Signer<'info>,
+}
+
 // Data structures
 #[account]
 #[derive(InitSpace)]
@@ -593,7 +709,14 @@ pub struct MarketClosed {
     pub authority: Pubkey,
 }
 
-// Error codes
+#[event]
+pub struct PlatformFeeUpdated {
+    pub old_fee_bps: u16,
+    pub new_fee_bps: u16,
+    pub authority: Pubkey,
+}
+
+// Enhanced error codes
 #[error_code]
 pub enum ErrorCode {
     #[msg("Insufficient outcomes for market")]
@@ -630,4 +753,33 @@ pub enum ErrorCode {
     UnauthorizedFeeCollection,
     #[msg("Unauthorized market close")]
     UnauthorizedMarketClose,
+    // New security-focused errors
+    #[msg("Platform fee too high")]
+    FeeTooHigh,
+    #[msg("Invalid fee recipient")]
+    InvalidFeeRecipient,
+    #[msg("Market duration too short")]
+    MarketDurationTooShort,
+    #[msg("Market duration too long")]
+    MarketDurationTooLong,
+    #[msg("Empty question")]
+    EmptyQuestion,
+    #[msg("Outcome too long")]
+    OutcomeTooLong,
+    #[msg("Empty outcome")]
+    EmptyOutcome,
+    #[msg("Duplicate outcomes")]
+    DuplicateOutcomes,
+    #[msg("Invalid oracle")]
+    InvalidOracle,
+    #[msg("Zero bet amount")]
+    ZeroBet,
+    #[msg("Arithmetic overflow")]
+    ArithmeticOverflow,
+    #[msg("No winning bets")]
+    NoWinningBets,
+    #[msg("Invalid winnings calculation")]
+    InvalidWinnings,
+    #[msg("Unauthorized fee update")]
+    UnauthorizedFeeUpdate,
 }
