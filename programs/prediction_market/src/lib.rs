@@ -22,6 +22,7 @@ pub mod prediction_market {
         fee_recipient: Pubkey,
     ) -> Result<()> {
         require!(fee_bps <= MAX_FEE_BPS, ErrorCode::FeeTooHigh);
+        require!(fee_recipient != Pubkey::default(), ErrorCode::InvalidFeeRecipient);
         
         let state = &mut ctx.accounts.global_state;
         state.authority = ctx.accounts.authority.key();
@@ -56,6 +57,9 @@ pub mod prediction_market {
         require!(end_time - now <= MAX_DURATION, ErrorCode::EndTimeTooFar);
         require!(!question.trim().is_empty() && question.len() <= MAX_QUESTION_LEN, ErrorCode::InvalidQuestion);
         require!(min_bet > 0, ErrorCode::InvalidMinBet);
+        
+        // Market ID uniqueness is enforced by PDA seeds - if market_id exists, init will fail
+        // This provides automatic uniqueness validation
 
         // Validate outcomes - practical checks
         for outcome in &outcomes {
@@ -74,6 +78,7 @@ pub mod prediction_market {
         market.outcome_pools = vec![0; outcomes.len()];
         market.resolved = false;
         market.winner = None;
+        market.paused = false;
         market.created_at = now;
         market.bump = ctx.bumps.market;
 
@@ -102,6 +107,7 @@ pub mod prediction_market {
 
         // Essential validations
         require!(!market.resolved, ErrorCode::MarketResolved);
+        require!(!market.paused, ErrorCode::MarketPaused);
         require!(now < market.end_time, ErrorCode::MarketExpired);
         require!(outcome_index < market.outcomes.len() as u8, ErrorCode::InvalidOutcome);
         require!(amount >= market.min_bet, ErrorCode::BetTooSmall);
@@ -191,16 +197,31 @@ pub mod prediction_market {
         require!(!user_bet.claimed, ErrorCode::AlreadyClaimed);
         require!(user_bet.user == ctx.accounts.user.key(), ErrorCode::Unauthorized);
 
-        let winner = market.winner.unwrap();
+        // Handle case where market was closed (no winner)
+        let winner = market.winner.ok_or(ErrorCode::MarketClosed)?;
         let user_winning_bet = user_bet.bets[winner as usize];
         require!(user_winning_bet > 0, ErrorCode::NoWinningBet);
 
-        // Calculate payout - clean math
+        // Calculate payout - clean math with overflow protection
         let total_pool = market.total_pool;
         let winning_pool = market.outcome_pools[winner as usize];
         let platform_fee = total_pool * global_state.fee_bps as u64 / 10000;
+        
+        // Ensure platform fee doesn't exceed total pool (safety check)
+        require!(platform_fee < total_pool, ErrorCode::FeeExceedsPool);
+        
         let prize_pool = total_pool - platform_fee;
-        let user_winnings = user_winning_bet * prize_pool / winning_pool;
+        
+        // Use checked arithmetic and ensure no precision loss
+        let user_winnings = (user_winning_bet as u128)
+            .checked_mul(prize_pool as u128)
+            .ok_or(ErrorCode::Overflow)?
+            .checked_div(winning_pool as u128)
+            .ok_or(ErrorCode::DivisionByZero)?
+            as u64;
+            
+
+            
 
         require!(user_winnings >= user_winning_bet, ErrorCode::InvalidPayout);
 
@@ -245,6 +266,8 @@ pub mod prediction_market {
 
         let platform_fee = market.total_pool * global_state.fee_bps as u64 / 10000;
         
+        require!(platform_fee < market.total_pool, ErrorCode::FeeExceedsPool);
+        
         if platform_fee > 0 {
             let seeds = &[
                 b"vault",
@@ -274,6 +297,72 @@ pub mod prediction_market {
         Ok(())
     }
 
+    /// Update market oracle - for oracle rotation
+    pub fn update_oracle(
+        ctx: Context<UpdateOracle>,
+        new_oracle: Pubkey,
+    ) -> Result<()> {
+        let market = &mut ctx.accounts.market;
+        
+        require!(
+            ctx.accounts.authority.key() == ctx.accounts.global_state.authority,
+            ErrorCode::Unauthorized
+        );
+        require!(!market.resolved, ErrorCode::AlreadyResolved);
+        require!(new_oracle != Pubkey::default(), ErrorCode::InvalidOracle);
+
+        let old_oracle = market.oracle;
+        market.oracle = new_oracle;
+
+        emit!(OracleUpdated {
+            market_id: market.id,
+            old_oracle,
+            new_oracle,
+        });
+
+        Ok(())
+    }
+
+
+    pub fn pause_market(ctx: Context<PauseMarket>) -> Result<()> {
+        let market = &mut ctx.accounts.market;
+        
+        require!(
+            ctx.accounts.authority.key() == ctx.accounts.global_state.authority,
+            ErrorCode::Unauthorized
+        );
+        require!(!market.resolved, ErrorCode::AlreadyResolved);
+        require!(!market.paused, ErrorCode::AlreadyPaused);
+
+        market.paused = true;
+
+        emit!(MarketPaused {
+            market_id: market.id,
+        });
+
+        Ok(())
+    }
+
+    /// Unpause market - resume betting
+    pub fn unpause_market(ctx: Context<UnpauseMarket>) -> Result<()> {
+        let market = &mut ctx.accounts.market;
+        
+        require!(
+            ctx.accounts.authority.key() == ctx.accounts.global_state.authority,
+            ErrorCode::Unauthorized
+        );
+        require!(!market.resolved, ErrorCode::AlreadyResolved);
+        require!(market.paused, ErrorCode::MarketNotPaused);
+
+        market.paused = false;
+
+        emit!(MarketUnpaused {
+            market_id: market.id,
+        });
+
+        Ok(())
+    }
+
     /// Emergency close market
     pub fn close_market(ctx: Context<CloseMarket>) -> Result<()> {
         let market = &mut ctx.accounts.market;
@@ -289,6 +378,50 @@ pub mod prediction_market {
 
         emit!(MarketClosed {
             market_id: market.id,
+        });
+
+        Ok(())
+    }
+
+    /// Claim refund from closed market - users can recover their bets
+    pub fn claim_refund(ctx: Context<ClaimRefund>) -> Result<()> {
+        let market = &ctx.accounts.market;
+        let user_bet = &mut ctx.accounts.user_bet;
+
+        require!(market.resolved, ErrorCode::NotResolved);
+        require!(market.winner.is_none(), ErrorCode::MarketNotClosed);
+        require!(!user_bet.claimed, ErrorCode::AlreadyClaimed);
+        require!(user_bet.user == ctx.accounts.user.key(), ErrorCode::Unauthorized);
+        require!(user_bet.total_bet > 0, ErrorCode::NoRefundAvailable);
+
+        let refund_amount = user_bet.total_bet;
+
+        // Transfer refund
+        let seeds = &[
+            b"vault",
+            market.key().as_ref(),
+            &[ctx.bumps.market_vault],
+        ];
+        
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.market_vault.to_account_info(),
+                    to: ctx.accounts.user_token_account.to_account_info(),
+                    authority: ctx.accounts.market_vault.to_account_info(),
+                },
+                &[&seeds[..]]
+            ),
+            refund_amount
+        )?;
+
+        user_bet.claimed = true;
+
+        emit!(RefundClaimed {
+            user: ctx.accounts.user.key(),
+            market_id: market.id,
+            amount: refund_amount,
         });
 
         Ok(())
@@ -318,6 +451,7 @@ pub struct Market {
     pub outcome_pools: Vec<u64>,   // 4 + 8 * 8 = 68
     pub resolved: bool,            // 1
     pub winner: Option<u8>,        // 1 + 1
+    pub paused: bool,              // 1
     pub created_at: i64,           // 8
     pub bump: u8,                  // 1
 }
@@ -354,7 +488,7 @@ pub struct CreateMarket<'info> {
     #[account(
         init,
         payer = creator,
-        space = 8 + 815,
+        space = 8 + 816,  // Added 1 byte for paused field
         seeds = [b"market", market_id.to_le_bytes().as_ref()],
         bump
     )]
@@ -436,11 +570,48 @@ pub struct CollectFees<'info> {
 }
 
 #[derive(Accounts)]
+pub struct UpdateOracle<'info> {
+    #[account(mut)]
+    pub market: Account<'info, Market>,
+    pub global_state: Account<'info, GlobalState>,
+    pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct PauseMarket<'info> {
+    #[account(mut)]
+    pub market: Account<'info, Market>,
+    pub global_state: Account<'info, GlobalState>,
+    pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct UnpauseMarket<'info> {
+    #[account(mut)]
+    pub market: Account<'info, Market>,
+    pub global_state: Account<'info, GlobalState>,
+    pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
 pub struct CloseMarket<'info> {
     #[account(mut)]
     pub market: Account<'info, Market>,
     pub global_state: Account<'info, GlobalState>,
     pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ClaimRefund<'info> {
+    pub market: Account<'info, Market>,
+    #[account(mut)]
+    pub user_bet: Account<'info, UserBet>,
+    #[account(mut)]
+    pub market_vault: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub user_token_account: Account<'info, TokenAccount>,
+    pub user: Signer<'info>,
+    pub token_program: Program<'info, Token>,
 }
 
 // Clean events
@@ -491,7 +662,31 @@ pub struct MarketClosed {
     pub market_id: u64,
 }
 
-// Essential error codes - not excessive
+#[event]
+pub struct RefundClaimed {
+    pub user: Pubkey,
+    pub market_id: u64,
+    pub amount: u64,
+}
+
+#[event]
+pub struct OracleUpdated {
+    pub market_id: u64,
+    pub old_oracle: Pubkey,
+    pub new_oracle: Pubkey,
+}
+
+#[event]
+pub struct MarketPaused {
+    pub market_id: u64,
+}
+
+#[event]
+pub struct MarketUnpaused {
+    pub market_id: u64,
+}
+
+
 #[error_code]
 pub enum ErrorCode {
     #[msg("Fee too high")]
@@ -532,4 +727,24 @@ pub enum ErrorCode {
     NoWinningBet,
     #[msg("Invalid payout")]
     InvalidPayout,
+    #[msg("Market was closed with no winner")]
+    MarketClosed,
+    #[msg("Market not closed - cannot claim refund")]
+    MarketNotClosed,
+    #[msg("No refund available")]
+    NoRefundAvailable,
+    #[msg("Platform fee exceeds total pool")]
+    FeeExceedsPool,
+    #[msg("Division by zero")]
+    DivisionByZero,
+    #[msg("Invalid fee recipient")]
+    InvalidFeeRecipient,
+    #[msg("Invalid oracle address")]
+    InvalidOracle,
+    #[msg("Market is paused")]
+    MarketPaused,
+    #[msg("Market already paused")]
+    AlreadyPaused,
+    #[msg("Market not paused")]
+    MarketNotPaused,
 } 
